@@ -12,9 +12,9 @@ hide:
 
 ## 🗞️ 最新一期
 
-（马上就来）
+**[2026-09-29 · 停机维护与手雷破门](/blog/2026/09/29/)**
 
-[:octicons-arrow-right-24: 查看全部日报](blog/index.md)
+[:octicons-arrow-right-24: 查看全部日报](/blog/)
 
 ---
 
