@@ -1,0 +1,32 @@
+baseURL = "https://tarkov-daily.pages.dev/"
+languageCode = "zh-cn"
+title = "诺文斯克日报"
+theme = "PaperMod"
+enableRobotsTXT = true
+
+[params]
+  description = "塔科夫每日速览 —— 官方改动 · 社区风向 · 萌新提示"
+  ShowReadingTime = false
+  ShowPostDate = true
+  ShowCodeCopyButtons = true
+
+[permalinks]
+  posts = "/blog/:year/:month/:day/"
+
+[menus]
+  [[menus.main]]
+    name = "首页"
+    url = "/"
+    weight = 10
+  [[menus.main]]
+    name = "全部日报"
+    url = "/archives/"
+    weight = 20
+  [[menus.main]]
+    name = "关于"
+    url = "/about/"
+    weight = 30
+
+# B站 iframe / details 等 HTML 标签必须放行
+[markup.goldmark.renderer]
+  unsafe = true

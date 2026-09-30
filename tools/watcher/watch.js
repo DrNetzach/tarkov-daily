@@ -1,0 +1,340 @@
+// 诺文斯克日报 · 情报监听爬虫
+// B站（Playwright 截获法，页面自带 w_webid 签名）+ Reddit RSS + Steam 公告
+// 用法: node watch.js            —— 增量检测，新内容写入 raw\事件流水.md
+//       node watch.js --dump     —— 输出五家 UP 最新投稿 JSON（给日报任务用）
+//       node watch.js --reset    —— 清空已见状态（首次初始化）
+// 双通道（2026-09-29 改造）：每路都有主备，谁都不硬阻塞——
+//   Steam : 代理优先（Clash 7890）→ 直连兜底。⚠️ 实测裸直连在国内超时不通，
+//           旧连通性表的「直连 ✅」是环境变量 HTTPS_PROXY 造成的伪直连，别信。
+//   Reddit: 专用代理通道，7890 没开就标「⚠️ 待补」不发请求（直连被墙，不试）。
+//   B站   : Playwright 自己的网络栈，不受下面的 fetch 影响。
+// 不设 NODE_USE_ENV_PROXY——通道流向全由代码显式控制，不再依赖环境。
+
+const { chromium } = require('playwright-core');
+const { execFileSync } = require('child_process');
+const net = require('net');
+const fs = require('fs');
+const path = require('path');
+
+const ROOT = path.resolve(__dirname, '..', '..'); // tarkov-daily
+const RAW_DIR = path.join(ROOT, 'raw');
+const STATE_FILE = path.join(__dirname, 'state.json');
+const LOG_FILE = path.join(RAW_DIR, '事件流水.md');
+
+const UPS = [
+  { name: '纱雾最可爱辣', mid: '152065343' },
+  { name: '三笠Ackerman01', mid: '25974860' },
+  { name: 'MR茼蒿', mid: '8052269' },
+  { name: '大傻哥丶', mid: '393480563' },
+  { name: '油墨香车', mid: '387630871' },
+];
+
+const STEAM_RSS = 'https://store.steampowered.com/feeds/news/app/3932890/?l=schinese';
+const REDDIT_RSS = 'https://www.reddit.com/r/EscapefromTarkov/.rss';
+const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0';
+
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch (e) {
+    return { lastRun: null, bvids: [], reddit: [], steam: [] };
+  }
+}
+function saveState(s) {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 1), 'utf8');
+}
+
+// ---------- B站 ----------
+async function fetchUpLatest(browser, up) {
+  const ctx = await browser.newContext({
+    userAgent: UA,
+    locale: 'zh-CN',
+    viewport: { width: 1280, height: 900 },
+  });
+  const page = await ctx.newPage();
+
+  const attemptLog = [];
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const candidates = [];
+    const onResp = async (r) => {
+      const u = r.url();
+      if (u.includes('api.bilibili.com') && u.includes('arc/search')) {
+        try {
+          candidates.push(await r.json());
+        } catch (e) {
+          candidates.push(null);
+        }
+      }
+    };
+    page.on('response', onResp);
+    try {
+      await page.goto(`https://space.bilibili.com/${up.mid}/video`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000,
+      });
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline && !candidates.some((j) => j && j.code === 0)) {
+        await page.waitForTimeout(500);
+      }
+    } catch (e) {
+      /* goto 超时也继续看 candidates */
+    }
+    page.removeListener('response', onResp);
+
+    for (const j of candidates) {
+      if (j && j.code === 0) {
+        const vlist = (j.data && j.data.list && j.data.list.vlist) || [];
+        if (vlist.length) {
+          await ctx.close();
+          // ⚠️ vlist[0] 不一定是最新（默认排序可能按播放量）——按 pubdate 排序取最新
+          const sorted = [...vlist].sort((a, b) => (b.pubdate || 0) - (a.pubdate || 0));
+          const v = sorted[0];
+          return {
+            up: up.name,
+            mid: up.mid,
+            bvid: v.bvid,
+            title: v.title,
+            play: v.play,
+            pubdate: v.pubdate,
+            duration: v.length,
+          };
+        }
+      }
+    }
+    // 412/失败 → 冷却重试
+    attemptLog.push(
+      candidates.length
+        ? candidates.map((j) => (j ? 'code=' + j.code : 'parse-fail')).join(',')
+        : 'no-response'
+    );
+    await page.waitForTimeout(8000 * attempt);
+  }
+  await ctx.close();
+  return { up: up.name, mid: up.mid, error: 'failed after 3 attempts [' + attemptLog.join(' | ') + ']' };
+}
+
+async function fetchAllUps() {
+  const browser = await chromium.launch({
+    executablePath: EDGE,
+    headless: true,
+    args: ['--disable-blink-features=AutomationControlled'],
+  });
+  const results = [];
+  try {
+    for (const up of UPS) {
+      try {
+        results.push(await fetchUpLatest(browser, up));
+      } catch (e) {
+        results.push({ up: up.name, mid: up.mid, error: String(e).slice(0, 160) });
+      }
+      await new Promise((r) => setTimeout(r, 3000)); // UP 之间冷却
+    }
+  } finally {
+    await browser.close();
+  }
+  return results;
+}
+
+// ---------- RSS（Reddit / Steam 共用） ----------
+function parseRssItems(xml) {
+  const items = [];
+  // 双格式（09-29 实测 Reddit .rss 返回 Atom <entry>，老版只认 <item> → 静默 0 条）：
+  //   RSS 2.0 <item>  = Steam 在用
+  //   Atom     <entry> = Reddit 在用
+  const blocks = [
+    ...(xml.match(/<item[\s>][\s\S]*?<\/item>/g) || []),
+    ...(xml.match(/<entry[\s>][\s\S]*?<\/entry>/g) || []),
+  ];
+  for (const block of blocks) {
+    // title 允许开标签带属性（Atom: <title type="html">）
+    const title = ((block.match(/<title(?:\s[^>]*)?>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/) || [])[1] || '').trim();
+    // link：先元素式 <link>url</link>（RSS），再属性式 <link href="url"/>（Atom）
+    const linkEl = (block.match(/<link>([\s\S]*?)<\/link>/) || [])[1];
+    const linkAttr = (block.match(/<link[^>]*\shref="([^"]+)"/) || [])[1];
+    const link = (linkEl || linkAttr || '').trim();
+    // guid：RSS <guid> → Atom <id> → link → title 逐级兜底
+    const guid = ((block.match(/<guid[^>]*>([\s\S]*?)<\/guid>/) || [])[1]
+      || (block.match(/<id>([\s\S]*?)<\/id>/) || [])[1]
+      || link || title).trim();
+    const date = ((block.match(/<(?:pubDate|updated|published)>([\s\S]*?)<\/(?:pubDate|updated|published)>/) || [])[1] || '').trim();
+    if (title) items.push({ title: decodeXml(title), link: decodeXml(link), guid: decodeXml(guid), date });
+  }
+  return items;
+}
+function decodeXml(s) {
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+async function fetchRss(url, referer) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': UA,
+        Accept: 'application/rss+xml, application/xml, text/xml, */*',
+        ...(referer ? { Referer: referer } : {}),
+      },
+      signal: controller.signal,
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return await resp.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 探测本地代理端口——连不上就不发 Reddit 请求，直接标待补（不阻塞 Steam/B站）
+function probePort(port, host = '127.0.0.1', timeoutMs = 800) {
+  return new Promise((resolve) => {
+    const sock = net.connect({ port, host });
+    const done = (ok) => {
+      try { sock.destroy(); } catch (e) {}
+      resolve(ok);
+    };
+    sock.setTimeout(timeoutMs, () => done(false));
+    sock.on('connect', () => done(true));
+    sock.on('error', () => done(false));
+  });
+}
+
+// 代理通道：curl.exe 走 Clash 7890（Windows 自带，per-request 不污染全局 fetch）
+// -sSf：静默但 HTTP 错误报错退出 → execFileSync 抛异常 → 被外层 catch 接住标 errors
+function fetchViaCurl(url) {
+  return execFileSync('curl.exe', [
+    '-sSf', '--max-time', '30',
+    '-x', 'http://127.0.0.1:7890',
+    '-A', UA,
+    '-H', 'Accept: application/rss+xml, application/xml, text/xml, */*',
+    url,
+  ], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+}
+
+// ---------- 主流程 ----------
+async function main() {
+  const mode = process.argv.includes('--dump') ? 'dump' : process.argv.includes('--reset') ? 'reset' : 'watch';
+  const now = new Date();
+  const stamp = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+
+  if (mode === 'reset') {
+    saveState({ lastRun: null, bvids: [], reddit: [], steam: [] });
+    console.log('state reset');
+    return;
+  }
+
+  const state = loadState();
+  if (mode === 'dump') {
+    const ups = await fetchAllUps();
+    console.log(JSON.stringify({ time: stamp, ups }, null, 1));
+    return;
+  }
+
+  // watch 模式
+  const fresh = { ups: [], reddit: [], steam: [], errors: [] };
+
+  // 1. B站（首跑建基线不报历史，同 Reddit/Steam——否则全新 state 会把 5 条旧投稿报成新）
+  try {
+    const ups = await fetchAllUps();
+    const baselineBili = state.bvids.length === 0;
+    for (const u of ups) {
+      if (u.error) {
+        fresh.errors.push(`bilibili ${u.up}: ${u.error}`);
+        continue;
+      }
+      if (!state.bvids.includes(u.bvid)) {
+        if (!baselineBili) fresh.ups.push(u);
+        state.bvids.push(u.bvid);
+      }
+    }
+    if (state.bvids.length > 200) state.bvids = state.bvids.slice(-200);
+  } catch (e) {
+    fresh.errors.push('bilibili: ' + String(e).slice(0, 160));
+  }
+
+  // 2. Reddit（首跑建基线不报历史；专用代理通道，代理没开标「待补」不阻塞）
+  try {
+    if (!(await probePort(7890))) {
+      fresh.errors.push('reddit: ⚠️ 代理 127.0.0.1:7890 未开，本条待补');
+    } else {
+      const baseline = state.reddit.length === 0;
+      const xml = fetchViaCurl(REDDIT_RSS);
+      const items = parseRssItems(xml);
+      for (const it of items) {
+        if (!state.reddit.includes(it.guid)) {
+          if (!baseline) fresh.reddit.push(it);
+          state.reddit.push(it.guid);
+        }
+      }
+      if (state.reddit.length > 300) state.reddit = state.reddit.slice(-300);
+    }
+  } catch (e) {
+    fresh.errors.push('reddit: ' + String(e).slice(0, 160));
+  }
+
+  // 3. Steam（首跑建基线；代理优先、直连兜底——实测真直连在国内超时不通）
+  try {
+    const baseline = state.steam.length === 0;
+    const xml = (await probePort(7890)) ? fetchViaCurl(STEAM_RSS) : await fetchRss(STEAM_RSS);
+    const items = parseRssItems(xml);
+    for (const it of items) {
+      if (!state.steam.includes(it.guid)) {
+        if (!baseline) fresh.steam.push(it);
+        state.steam.push(it.guid);
+      }
+    }
+    if (state.steam.length > 100) state.steam = state.steam.slice(-100);
+  } catch (e) {
+    fresh.errors.push('steam: ' + String(e).slice(0, 160));
+  }
+
+  state.lastRun = now.toISOString();
+  saveState(state);
+
+  const hasNew = fresh.ups.length || fresh.reddit.length || fresh.steam.length;
+
+  // 写事件流水（只在有新内容时追加）
+  if (hasNew) {
+    if (!fs.existsSync(RAW_DIR)) fs.mkdirSync(RAW_DIR, { recursive: true });
+    let block = `\n## ${stamp}\n`;
+    for (const u of fresh.ups) {
+      const t = new Date(u.pubdate * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+      block += `- 🆕 **B站 ${u.up}** 发布《${u.title}》 \`${u.bvid}\` 时长 ${u.duration}s 播放 ${u.play}（发布于 ${t}）\n`;
+    }
+    for (const it of fresh.steam) {
+      block += `- 🆕 **Steam 官方** ${it.title} （${it.date}）\n`;
+    }
+    for (const it of fresh.reddit) {
+      block += `- 🆕 **Reddit** ${it.title}\n`;
+    }
+    fs.appendFileSync(LOG_FILE, block, 'utf8');
+  }
+
+  // stdout 摘要（cron 任务读）
+  const summary = {
+    time: stamp,
+    newBili: fresh.ups.length,
+    newReddit: fresh.reddit.length,
+    newSteam: fresh.steam.length,
+    errors: fresh.errors,
+    items: [
+      ...fresh.ups.map((u) => `B站 ${u.up}: 《${u.title}》 ${u.bvid}`),
+      ...fresh.steam.map((s) => `Steam: ${s.title}`),
+      ...fresh.reddit.slice(0, 10).map((r) => `Reddit: ${r.title}`),
+    ],
+  };
+  console.log(JSON.stringify(summary, null, 1));
+  if (fresh.reddit.length > 10) console.log(`(Reddit 另有 ${fresh.reddit.length - 10} 条见事件流水)`);
+}
+
+main().catch((e) => {
+  console.error('FATAL: ' + (e && e.stack ? e.stack : e));
+  process.exit(1);
+});

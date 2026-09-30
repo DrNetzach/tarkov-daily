@@ -1,4 +1,7 @@
+public/
 site/
+resources/
+.hugo_build.lock
 .cache/
 __pycache__/
 *.py[cod]
