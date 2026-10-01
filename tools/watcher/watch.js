@@ -27,6 +27,7 @@ const UPS = [
   { name: 'MR茼蒿', mid: '8052269' },
   { name: '大傻哥丶', mid: '393480563' },
   { name: '油墨香车', mid: '387630871' },
+  { name: 'Battlestate官方', mid: '1119663253' }, // 09-30 主人令加入：官号投稿（前瞻/访谈），动态公告另走手动/后续
 ];
 
 const STEAM_RSS = 'https://store.steampowered.com/feeds/news/app/3932890/?l=schinese';
@@ -39,7 +40,7 @@ function loadState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
   } catch (e) {
-    return { lastRun: null, bvids: [], reddit: [], steam: [] };
+    return { lastRun: null, bvids: [], reddit: [], steam: [], dynamics: [] };
   }
 }
 function saveState(s) {
@@ -218,14 +219,107 @@ function fetchViaCurl(url) {
   ], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
 }
 
+// 官号动态（Battlestate官方 mid 1119663253）——文字公告全在这，PS 直连会 412，
+// 必须走 Playwright 截获法：打开动态页，截它自己发的 polymer/web-dynamic 响应
+async function fetchOfficialDynamics() {
+  const browser = await chromium.launch({
+    executablePath: EDGE,
+    headless: true,
+    args: ['--disable-blink-features=AutomationControlled'],
+  });
+  const ctx = await browser.newContext({
+    userAgent: UA,
+    locale: 'zh-CN',
+    viewport: { width: 1280, height: 900 },
+  });
+  const page = await ctx.newPage();
+  const candidates = [];
+  const onResp = async (r) => {
+    const u = r.url();
+    if (u.includes('api.bilibili.com') && u.includes('polymer/web-dynamic') && u.includes('feed/space')) {
+      try { candidates.push(await r.json()); } catch (e) { candidates.push(null); }
+    }
+  };
+  page.on('response', onResp);
+  try {
+    await page.goto('https://space.bilibili.com/1119663253/dynamic', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
+    const deadline = Date.now() + 25000;
+    // 等到「有货」的响应才算数：轮询空壳（update_num/offset，items=0）code 也是 0，会假满足
+    const hasReal = () => candidates.some((j) => j && j.code === 0 && j.data && Array.isArray(j.data.items) && j.data.items.length);
+    while (Date.now() < deadline && !hasReal()) {
+      await page.waitForTimeout(500);
+    }
+  } catch (e) {
+    /* goto 超时也继续看 candidates */
+  }
+  page.removeListener('response', onResp);
+  await ctx.close();
+  await browser.close();
+
+  for (const j of candidates) {
+    // 空壳响应（code=0 但 items 空）会抢先命中，必须跳过
+    if (j && j.code === 0 && j.data && Array.isArray(j.data.items) && j.data.items.length) {
+      return j.data.items.slice(0, 12).map((it) => {
+        // 09-30 实测定稿：时间在 module_author.pub_time（人类可读），正文短的在 desc.text、
+        // 长文（opus 改版）在 major.opus.text —— 双路径兜底
+        const mods = it.modules || {};
+        const md = mods.module_dynamic || {};
+        const desc = md.desc || {};
+        const opus = (md.major && md.major.opus) || {};
+        const author = mods.module_author || {};
+        // desc.text / opus.text 可能是对象（opus 富文本 {raw:...} 或嵌套 {text:...}）——下钻取字符串
+        const toStr = (v) => {
+          if (typeof v === 'string') return v;
+          if (v && typeof v === 'object') {
+            if (typeof v.text === 'string') return v.text;
+            if (typeof v.raw === 'string') return v.raw;
+            try { return JSON.stringify(v); } catch (e) { /* fallthrough */ }
+          }
+          return '';
+        };
+        const text = (toStr(desc.text) || toStr(opus.text) || toStr(opus.summary)).replace(/\s+/g, ' ').trim();
+        return {
+          id: it.id_str,
+          type: it.type || '',
+          time: author.pub_time || it.pub_time || '',
+          text,
+        };
+      });
+    }
+  }
+  const brief = candidates.map((j) => {
+    if (!j) return 'null';
+    const d = j.data || {};
+    const items = Array.isArray(d.items) ? `arr(${d.items.length})` : typeof d.items;
+    return `code=${j.code} dataKeys=[${Object.keys(d).join('/')}] items=${items}`;
+  });
+  return { error: 'no usable dynamic response: ' + (brief.join(' | ') || 'captured-nothing') };
+}
+
 // ---------- 主流程 ----------
 async function main() {
-  const mode = process.argv.includes('--dump') ? 'dump' : process.argv.includes('--reset') ? 'reset' : 'watch';
+  const mode = process.argv.includes('--dump') ? 'dump' : process.argv.includes('--reset') ? 'reset' : process.argv.includes('--official') ? 'official' : 'watch';
+
+  // --official：单测官号动态通道（只开 1 个页面，不烧风控额度，不动 state）
+  if (mode === 'official') {
+    const list = await fetchOfficialDynamics();
+    console.log(JSON.stringify(
+      Array.isArray(list)
+        ? { ok: true, count: list.length, sample: list.slice(0, 3).map((x) => ({ id: x.id, time: x.time, head: (x.text || '').slice(0, 70) })) }
+        : list,
+      null, 1
+    ));
+    process.exit(Array.isArray(list) ? 0 : 1);
+  }
+  // （诊断版在 fetchOfficialDynamics 内：--official 失败时 error 串含 data keys 概要）
   const now = new Date();
   const stamp = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
 
   if (mode === 'reset') {
-    saveState({ lastRun: null, bvids: [], reddit: [], steam: [] });
+    saveState({ lastRun: null, bvids: [], reddit: [], steam: [], dynamics: [] });
     console.log('state reset');
     return;
   }
@@ -238,7 +332,7 @@ async function main() {
   }
 
   // watch 模式
-  const fresh = { ups: [], reddit: [], steam: [], errors: [] };
+  const fresh = { ups: [], reddit: [], steam: [], official: [], errors: [] };
 
   // 1. B站（首跑建基线不报历史，同 Reddit/Steam——否则全新 state 会把 5 条旧投稿报成新）
   try {
@@ -295,6 +389,26 @@ async function main() {
     fresh.errors.push('steam: ' + String(e).slice(0, 160));
   }
 
+  // 4. 官号动态（首跑只建账不报）
+  try {
+    state.dynamics = state.dynamics || [];
+    const baseline = state.dynamics.length === 0;
+    const list = await fetchOfficialDynamics();
+    if (list.error) {
+      fresh.errors.push('official-dynamics: ' + list.error);
+    } else {
+      for (const it of list) {
+        if (!state.dynamics.includes(it.id)) {
+          if (!baseline) fresh.official.push(it);
+          state.dynamics.push(it.id);
+        }
+      }
+      if (state.dynamics.length > 50) state.dynamics = state.dynamics.slice(-50);
+    }
+  } catch (e) {
+    fresh.errors.push('official-dynamics: ' + String(e).slice(0, 160));
+  }
+
   state.lastRun = now.toISOString();
   saveState(state);
 
@@ -314,6 +428,9 @@ async function main() {
     for (const it of fresh.reddit) {
       block += `- 🆕 **Reddit** ${it.title}\n`;
     }
+    for (const it of fresh.official) {
+      block += `- 🆕 **官方动态**（${it.time}）${(it.text || '').slice(0, 140)}\n`;
+    }
     fs.appendFileSync(LOG_FILE, block, 'utf8');
   }
 
@@ -326,6 +443,7 @@ async function main() {
     errors: fresh.errors,
     items: [
       ...fresh.ups.map((u) => `B站 ${u.up}: 《${u.title}》 ${u.bvid}`),
+      ...fresh.official.map((o) => `官方动态(${o.time}): ${(o.text || '').slice(0, 70)}`),
       ...fresh.steam.map((s) => `Steam: ${s.title}`),
       ...fresh.reddit.slice(0, 10).map((r) => `Reddit: ${r.title}`),
     ],
